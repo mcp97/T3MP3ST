@@ -81,6 +81,8 @@ Slow local agents can be given more room with `T3MP3ST_LOCAL_AGENT_TIMEOUT_MS`
 for each CLI call, `T3MP3ST_TASK_TIMEOUT_MS` for mission tasks, and
 `T3MP3ST_GENERAL_TIMEOUT_MS` for planning requests. Values are milliseconds.
 
+**Codex vs OpenRouter:** OpenRouter can route Codex-family models, but that still means OpenRouter auth and billing through `OPENROUTER_API_KEY`. The keyless Codex path here is different: T3MP3ST runs local `codex exec` through your signed-in Codex CLI/ChatGPT plan account and does not store a Codex token.
+
 Or run it **fully offline** on your own model — no key, no cloud. Defaults to Ollama; point it at any OpenAI-compatible server (LM Studio, vLLM, llama.cpp):
 
 ```bash
@@ -205,7 +207,7 @@ Operators map to MITRE ATT&CK and Cyber Kill Chain phases (recon is live; later 
 | **Coordinator** | Command & Control | TA0011 | mission control, orchestration |
 | **Analyst** | Analysis | — | pattern analysis, reporting |
 
-**Providers:** OpenRouter, Venice, Anthropic, OpenAI, or a keyless local agent (Claude Code / Codex / Hermes). Set `OPENROUTER_API_KEY` / `VENICE_API_KEY` / `ANTHROPIC_API_KEY`, or connect an agent in Settings.
+**Providers:** OpenRouter, Venice, Anthropic, OpenAI, Codex CLI, or a keyless local agent (Claude Code / Codex / Hermes). Set a provider API key, select Codex CLI, or connect an agent in Settings.
 
 **Integrations:** `node dist/mcp-server.js` exposes `security_recon` to MCP-aware agents. `npm run server` starts the HTTP API (`POST /api/mission/start`, `GET /api/mission/status`, and more). Full reference in [docs/](docs/).
 

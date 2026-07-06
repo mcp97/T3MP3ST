@@ -17,7 +17,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { LLMConfig, LLMMessage, LLMResponse, LLMProvider, LLMToolDefinition, LLMToolCall, FallbackEntry } from '../types/index.js';
 import { config } from '../config/index.js';
-import { localAgentChat } from '../agent/local-agents.js';
+import { localAgentChat, localAgentChildEnv } from '../agent/local-agents.js';
 
 // =============================================================================
 // LLM EVENTS
@@ -994,7 +994,7 @@ class CodexAdapter implements LLMProviderAdapter {
       const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
         const child = spawn(command, args, {
           stdio: ['pipe', 'pipe', 'pipe'],
-          env: { ...process.env, NO_COLOR: '1' },
+          env: { ...localAgentChildEnv(), NO_COLOR: '1' },
         });
 
         let stdout = '';

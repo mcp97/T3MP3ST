@@ -97,7 +97,7 @@
   "license": "AGPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/elder-plinius/t3mp3st.git"
+    "url": "git+https://github.com/alignedais/T3MP3ST.git"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.1",

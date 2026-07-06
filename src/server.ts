@@ -16,13 +16,13 @@ import { appendFile, mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
 import { createHash, randomUUID } from 'crypto';
-import { config } from './config/index.js';
+import { config, providerNeedsApiKey, resolveProviderForRequest } from './config/index.js';
 import { redactString, redactLedgerText, redactSecrets } from './redact.js';
 import { LLMBackbone } from './llm/index.js';
 import { TempestCommand } from './index.js';
 import { OpGeneral } from './general/index.js';
 import type { Directive } from './general/index.js';
-import { detectLocalAgents, pingLocalAgent, runLocalAgent, syncLocalAgentSelection } from './agent/local-agents.js';
+import { detectLocalAgents, localAgentChildEnv, pingLocalAgent, runLocalAgent, syncLocalAgentSelection } from './agent/local-agents.js';
 import { FRONTIER_ARSENAL_MILESTONE, NETWORK_COMMANDS, SAFE_COMMANDS, TOOL_ADAPTERS, adapterForBinary, adaptersForFamily, summarizeToolCatalog } from './arsenal/catalog.js';
 import { AGENT_PROMPT_PACKS, FOREFRONT_PRESSURE_LANES, OPERATOR_RUNBOOKS, RESOURCE_PACKS, WORKFLOW_PRESETS, forefrontPressureForFamily, promptPacksForFamily, resourcesForFamily, runbookForFamily, searchResources, workflowPresetsForFamily } from './resources/index.js';
 import { AI_REDTEAM_PLAYBOOK, AI_REDTEAM_TECHNIQUE_IDS, aiRedTeamBriefing } from './resources/ai-redteam-playbook.js';
@@ -266,12 +266,58 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 
 let llm: LLMBackbone | null = null;
 
+type CodexExecProbeState = {
+  command: string;
+  ok: boolean;
+  checkedAt: string;
+  error?: string;
+};
+
+let codexExecProbeState: CodexExecProbeState | null = null;
+
+function isLLMConfigConfigured(llmConfig: { provider: string; apiKey?: string }): boolean {
+  return providerNeedsApiKey(llmConfig.provider) ? Boolean(llmConfig.apiKey) : true;
+}
+
+function currentCodexCommand(): string {
+  return config.get('codex').command || 'codex';
+}
+
+function isCodexExecProbeReady(command = currentCodexCommand()): boolean {
+  return Boolean(codexExecProbeState?.ok && codexExecProbeState.command === command);
+}
+
+function recordCodexExecProbe(state: CodexExecProbeState): void {
+  codexExecProbeState = state;
+}
+
+function llmConfigErrorStatus(message: string): number {
+  if (/API key required|Unknown provider/.test(message)) return 400;
+  return 500;
+}
+
 async function initLLM(): Promise<LLMBackbone | null> {
   try {
     const llmConfig = config.getLLMConfig();
     if (providerNeedsApiKey(llmConfig.provider) && !llmConfig.apiKey) {
       console.warn('[T3MP3ST] No API key configured - LLM features disabled');
       return null;
+    }
+    if (llmConfig.provider === 'codex') {
+      const command = currentCodexCommand();
+      try {
+        await execFileAsync(command, ['--version'], { timeout: 5000 });
+      } catch (error: any) {
+        const message = error?.message || String(error);
+        recordCodexExecProbe({
+          command,
+          ok: false,
+          checkedAt: nowIso(),
+          error: `Codex CLI unavailable: ${message}`,
+        });
+        console.warn(`[T3MP3ST] Codex CLI unavailable - LLM features disabled: ${message}`);
+        return null;
+      }
     }
     const backbone = new LLMBackbone(llmConfig);
     console.log(`[T3MP3ST] LLM initialized: ${llmConfig.provider}/${llmConfig.model}`);
@@ -4232,6 +4278,7 @@ function healthPayload(): Record<string, unknown> {
   const cmd = getTempestCommand();
   const llmConfig = config.getLLMConfig();
   const activeMission = cmd?.mission.getActiveMission();
+  const codexExecReady = llmConfig.provider === 'codex' ? isCodexExecProbeReady() : undefined;
   return {
     ok: true,
     status: 'operational',
@@ -4240,11 +4287,15 @@ function healthPayload(): Record<string, unknown> {
     version: '0.2.1',
     apiVersion: 'v1',
     llm: {
-      configured: Boolean(llmConfig.apiKey) || llmConfig.provider === 'codex',
-      connected: Boolean(llm) || llmConfig.provider === 'codex',
+      configured: isLLMConfigConfigured(llmConfig),
+      connected: Boolean(llm),
       provider: llmConfig.provider,
       model: llmConfig.model,
       codexAccountMode: '/api/codex/status',
+      ...(llmConfig.provider === 'codex' ? {
+        execReady: Boolean(codexExecReady),
+        lastExecProbeAt: codexExecProbeState?.command === currentCodexCommand() ? codexExecProbeState.checkedAt : null,
+      } : {}),
     },
     storage: {
       ok: true,
@@ -4366,6 +4417,16 @@ async function inspectToolAvailability(): Promise<Array<{ id: string; name: stri
 async function buildPreflightReport(): Promise<Record<string, unknown>> {
   const tools = await inspectToolAvailability();
   const llmConfig = config.getLLMConfig();
+  const llmConfigured = isLLMConfigConfigured(llmConfig);
+  const codexExecReady = llmConfig.provider === 'codex' ? isCodexExecProbeReady() : undefined;
+  const llmReady = llmConfig.provider === 'codex'
+    ? Boolean(llm) && Boolean(codexExecReady)
+    : llmConfigured;
+  const llmDetail = llmReady
+    ? `${llmConfig.provider}:${llmConfig.model}`
+    : llmConfig.provider === 'codex'
+      ? 'Codex selected but exec readiness is not verified; run POST /api/codex/probe.'
+      : 'No API key configured; local contracts and drills still work.';
   const requiredTools = new Set(['file', 'curl', 'git']);
   const missingRequired = tools.filter(tool => requiredTools.has(tool.name) && !tool.available).map(tool => tool.name);
   const missingRecon = tools.filter(tool => ['nmap', 'dig'].includes(tool.name) && !tool.available).map(tool => tool.name);
@@ -4381,7 +4442,12 @@ async function buildPreflightReport(): Promise<Record<string, unknown>> {
   const checks = [
     { id: 'api', label: 'API server', status: 'ok', detail: `mode=${currentMode()}` },
     { id: 'storage', label: 'State storage', status: 'ok', detail: stateRoot() },
-    { id: 'llm', label: 'LLM provider', status: llmConfig.apiKey ? 'ok' : 'warn', detail: llmConfig.apiKey ? `${llmConfig.provider}:${llmConfig.model}` : 'No API key configured; local contracts and drills still work.' },
+    {
+      id: 'llm',
+      label: 'LLM provider',
+      status: llmReady ? 'ok' : 'warn',
+      detail: llmDetail,
+    },
     { id: 'tools-core', label: 'Core tools', status: missingRequired.length ? 'block' : 'ok', detail: missingRequired.length ? `Missing ${missingRequired.join(', ')}` : 'file, curl, and git detected' },
     { id: 'tools-recon', label: 'Recon tools', status: missingRecon.length ? 'warn' : 'ok', detail: missingRecon.length ? `Missing ${missingRecon.join(', ')}` : 'nmap and dig detected' },
     { id: 'arsenal-catalog', label: 'Tool adapter catalog', status: TOOL_ADAPTERS.length >= 45 ? 'ok' : 'warn', detail: `${TOOL_ADAPTERS.length}/${FRONTIER_ARSENAL_MILESTONE} wired / ${installedCommandReady}/${commandReadyTools.length} installed / ${missingHighValue.length} high-value missing` },
@@ -5940,6 +6006,19 @@ app.post('/api/llm/chat', async (req: Request, res: Response): Promise<void> => 
   // safe here because the cross-origin CSRF guard above blocks foreign-webpage drive-by.
   const { message, systemPrompt } = req.body;
   if (!message) { res.status(400).json({ error: 'Message required' }); return; }
+  const llmConfig = config.getLLMConfig();
+  if (llmConfig.provider === 'codex' && !isCodexExecProbeReady()) {
+    const command = currentCodexCommand();
+    const probeState = codexExecProbeState?.command === command ? codexExecProbeState : null;
+    res.status(503).json({
+      error: probeState?.error
+        ? `Codex exec not ready: ${probeState.error}`
+        : 'Codex exec readiness is not verified; run POST /api/codex/probe.',
+      codexStatus: '/api/codex/status',
+      codexProbe: '/api/codex/probe',
+    });
+    return;
+  }
   if (!llm) { res.status(503).json({ error: 'LLM not configured' }); return; }
   try {
     const response = await llm.prompt(message, systemPrompt);
@@ -5963,8 +6042,8 @@ app.post('/api/mission/start', async (req: Request, res: Response): Promise<void
     targets = [],
     operators = [],
     apiKey,
-    provider = 'openrouter',
-    model = 'anthropic/claude-sonnet-4',
+    provider,
+    model,
     // OPTIONAL white-box source: an absolute path to a LOCAL repo you own. When
     // present, we ingest + security-rank it and hand the packed source to the
     // command via setWhiteboxSource BEFORE start(), so operators reason over the
@@ -5972,14 +6051,12 @@ app.post('/api/mission/start', async (req: Request, res: Response): Promise<void
     repoPath,
   } = req.body;
 
-  // Use provided apiKey or fall back to server-configured one. Local-agent backends
-  // (Claude Code / Codex / Hermes) need NO key — the agent uses its own login.
-  // SECURITY NOTE: apiKey is read from the request body (Authorization header is
-  // preferred). Kept body-accepted for the same-origin UI; only reachable from
-  // the local operator (loopback bind + origin guard). Header move is out of scope.
-  const effectiveKey = apiKey || config.getLLMConfig().apiKey;
-  if (providerNeedsApiKey(provider) && !effectiveKey) {
-    res.status(400).json({ error: 'API key required — pass apiKey, configure one on the server, or connect a local agent (Claude Code / Codex / Hermes)' });
+  let missionConfig;
+  try {
+    missionConfig = resolveGeneralLLMConfig(provider, model, apiKey);
+  } catch (error: any) {
+    const message = error.message || 'API key required';
+    res.status(llmConfigErrorStatus(message)).json({ error: message });
     return;
   }
   if (provider === 'local-agent') {
@@ -6019,7 +6096,7 @@ app.post('/api/mission/start', async (req: Request, res: Response): Promise<void
   }
 
   try {
-    const cmd = createTempestCommandInstance(name, effectiveKey, provider, model);
+    const cmd = createTempestCommandInstance(name, missionConfig.apiKey, missionConfig.provider, missionConfig.model);
 
     // Add targets
     for (const t of targets) {
@@ -6474,10 +6551,6 @@ app.get('/api/mission/findings', (_req: Request, res: Response) => {
 /** Active OpGeneral instance */
 let activeGeneral: OpGeneral | null = null;
 
-function providerNeedsApiKey(provider: string): boolean {
-  return !['codex', 'mock', 'local', 'local-agent'].includes(provider);
-}
-
 function readPositiveTimeoutEnv(name: string): number | undefined {
   const raw = process.env[name];
   if (raw == null || raw.trim() === '') return undefined;
@@ -6496,7 +6569,7 @@ function readGeneralTimeoutEnv(): number | undefined {
 // the key in the body, so we accept it to avoid breaking it. Moving to a header
 // needs a coordinated UI change and is out of scope. The body key is only ever
 // reachable from the local operator (loopback bind + origin guard).
-function resolveGeneralLLMConfig(provider: string, model: string | undefined, apiKey: string | undefined): {
+function resolveGeneralLLMConfig(provider: string | undefined, model: string | undefined, apiKey: string | undefined): {
   provider: any;
   model: string;
   apiKey?: string;
@@ -6504,7 +6577,7 @@ function resolveGeneralLLMConfig(provider: string, model: string | undefined, ap
   temperature: number;
   timeout: number;
 } {
-  const selectedProvider = provider || 'openrouter';
+  const selectedProvider = resolveProviderForRequest(provider, apiKey, config.get('defaultProvider'));
   // Local-agent backends (Claude Code / Codex / Hermes via the connector) need NO API key — the
   // agent uses its own login. The agent id (codex|claude|hermes) travels in `model`.
   if (selectedProvider === 'local-agent') {
@@ -6564,6 +6637,7 @@ function bringUpMissionFromPlan(
 
 async function runCodexExecReadinessProbe(command: string): Promise<{ stdout: string; stderr: string }> {
   const marker = 'T3MP3ST_CODEX_READY';
+  const timeoutMs = Number(process.env.T3MP3ST_CODEX_PROBE_TIMEOUT_MS) || 240000;
   const args = [
     '--ask-for-approval',
     'never',
@@ -6584,7 +6658,7 @@ async function runCodexExecReadinessProbe(command: string): Promise<{ stdout: st
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, NO_COLOR: '1' },
+      env: { ...localAgentChildEnv(), NO_COLOR: '1' },
     });
 
     let stdout = '';
@@ -6592,10 +6666,10 @@ async function runCodexExecReadinessProbe(command: string): Promise<{ stdout: st
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
       reject(new Error('Codex exec readiness probe timed out'));
-    }, 30000);
+    }, timeoutMs);
 
     // Bounded accumulation so a runaway/verbose child can't grow these strings without limit
-    // before the 30s timer fires (matches the local-agent caps). A normal probe emits a tiny
+    // before the timeout fires. A normal probe emits a tiny
     // marker, so this only trims a pathological flood.
     child.stdout.on('data', chunk => { if (stdout.length < 8_000_000) stdout += chunk.toString(); });
     child.stderr.on('data', chunk => { if (stderr.length < 200_000) stderr += chunk.toString(); });
@@ -6621,6 +6695,8 @@ async function runCodexExecReadinessProbe(command: string): Promise<{ stdout: st
 /**
  * GET /api/codex/status — Check whether local Codex CLI/account auth can be used.
  */
+const CODEX_EXEC_MODE = 'codex --ask-for-approval never exec --ephemeral --sandbox read-only';
+
 function codexUnavailable(res: Response, error: any): void {
   res.status(503).json({
     available: false,
@@ -6635,8 +6711,9 @@ function codexUnavailable(res: Response, error: any): void {
 // it lives on POST /api/codex/probe below, behind the cross-origin guard.
 app.get('/api/codex/status', async (_req: Request, res: Response): Promise<void> => {
   try {
-    const command = config.get('codex').command || 'codex';
+    const command = currentCodexCommand();
     const { stdout } = await execFileAsync(command, ['--version'], { timeout: 5000 });
+    const probeState = codexExecProbeState?.command === command ? codexExecProbeState : null;
     res.json({
       available: true,
       provider: 'codex',
@@ -6644,7 +6721,11 @@ app.get('/api/codex/status', async (_req: Request, res: Response): Promise<void>
       tokenHandling: 'no token is accepted by or returned from T3MP3ST',
       command,
       version: stdout.trim(),
-      executionMode: 'codex exec --ephemeral --sandbox read-only --ask-for-approval never',
+      executionMode: CODEX_EXEC_MODE,
+      execReady: Boolean(probeState?.ok),
+      selfTest: probeState ? (probeState.ok ? 'passed' : 'failed') : 'not_run',
+      lastProbeAt: probeState?.checkedAt || null,
+      executionError: probeState?.ok ? undefined : probeState?.error,
       execProbe: 'POST /api/codex/probe',   // exec self-test moved off GET (B-04)
     });
   } catch (error: any) {
@@ -6656,28 +6737,48 @@ app.get('/api/codex/status', async (_req: Request, res: Response): Promise<void>
 // guard covers it; a drive-by page can't trigger `codex exec` via a bare GET.
 // Returns availability + version plus the exec self-test result.
 app.post('/api/codex/probe', async (_req: Request, res: Response): Promise<void> => {
+  const command = currentCodexCommand();
   try {
-    const command = config.get('codex').command || 'codex';
     const { stdout } = await execFileAsync(command, ['--version'], { timeout: 5000 });
+    const version = stdout.trim();
     const payload: Record<string, unknown> = {
       available: true,
       provider: 'codex',
       command,
-      version: stdout.trim(),
-      executionMode: 'codex exec --ephemeral --sandbox read-only --ask-for-approval never',
+      version,
+      executionMode: CODEX_EXEC_MODE,
     };
     try {
       const probe = await runCodexExecReadinessProbe(command);
       const combined = `${probe.stdout || ''}\n${probe.stderr || ''}`;
       payload.execReady = combined.includes('T3MP3ST_CODEX_READY');
       payload.selfTest = payload.execReady ? 'passed' : 'completed_without_ready_marker';
+      recordCodexExecProbe({
+        command,
+        ok: Boolean(payload.execReady),
+        checkedAt: nowIso(),
+        error: payload.execReady ? undefined : 'Codex exec completed without ready marker',
+      });
     } catch (probeError: any) {
+      const error = String(probeError?.stderr || probeError?.message || probeError).trim().slice(0, 1000);
       payload.execReady = false;
       payload.selfTest = 'failed';
-      payload.executionError = String(probeError?.stderr || probeError?.message || probeError).trim().slice(0, 1000);
+      payload.executionError = error;
+      recordCodexExecProbe({
+        command,
+        ok: false,
+        checkedAt: nowIso(),
+        error,
+      });
     }
     res.json(payload);
   } catch (error: any) {
+    recordCodexExecProbe({
+      command,
+      ok: false,
+      checkedAt: nowIso(),
+      error: error?.message || 'Codex CLI unavailable',
+    });
     codexUnavailable(res, error);
   }
 });
@@ -6697,8 +6798,8 @@ app.post('/api/general/plan', async (req: Request, res: Response): Promise<void>
     urgency,
     opsecPreference,
     apiKey,
-    provider = 'openrouter',
-    model = 'anthropic/claude-sonnet-4',
+    provider,
+    model,
   } = req.body;
 
   if (!objective) {
@@ -6747,7 +6848,7 @@ app.post('/api/general/plan', async (req: Request, res: Response): Promise<void>
   } catch (error: any) {
     console.error('[T3MP3ST] General planning failed:', error);
     const message = error.message || 'Planning failed';
-    res.status(/API key required|Unknown provider/.test(message) ? 400 : 500).json({ error: message });
+    res.status(llmConfigErrorStatus(message)).json({ error: message });
   }
 });
 
@@ -6771,15 +6872,16 @@ app.post('/api/general/execute', async (req: Request, res: Response): Promise<vo
 
   const {
     apiKey,
-    provider = 'openrouter',
-    model = 'anthropic/claude-sonnet-4',
+    provider,
+    model,
   } = req.body;
 
   let generalConfig;
   try {
     generalConfig = resolveGeneralLLMConfig(provider, model, apiKey);
   } catch (error: any) {
-    res.status(400).json({ error: error.message || 'API key required' });
+    const message = error.message || 'API key required';
+    res.status(llmConfigErrorStatus(message)).json({ error: message });
     return;
   }
 
@@ -6884,8 +6986,8 @@ app.post('/api/general/auto', async (req: Request, res: Response): Promise<void>
     urgency,
     opsecPreference,
     apiKey,
-    provider = 'openrouter',
-    model = 'anthropic/claude-sonnet-4',
+    provider,
+    model,
   } = req.body;
 
   if (!objective) {
@@ -6897,7 +6999,8 @@ app.post('/api/general/auto', async (req: Request, res: Response): Promise<void>
   try {
     generalConfig = resolveGeneralLLMConfig(provider, model, apiKey);
   } catch (error: any) {
-    res.status(400).json({ error: error.message || 'API key required' });
+    const message = error.message || 'API key required';
+    res.status(llmConfigErrorStatus(message)).json({ error: message });
     return;
   }
 
@@ -7143,7 +7246,7 @@ import { Admiral, briefToDirective, type ChatMsg, type MissionBrief } from './ad
  */
 app.post('/api/admiral/converse', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { messages, provider = 'openrouter', model, apiKey } = req.body as {
+    const { messages, provider, model, apiKey } = req.body as {
       messages: ChatMsg[]; provider?: string; model?: string; apiKey?: string;
     };
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -7161,7 +7264,8 @@ app.post('/api/admiral/converse', async (req: Request, res: Response): Promise<v
     const turn = await admiral.converse(messages);
     res.json(turn);
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Admiral converse failed' });
+    const message = error.message || 'Admiral converse failed';
+    res.status(llmConfigErrorStatus(message)).json({ error: message });
   }
 });
 
@@ -7173,7 +7277,7 @@ app.post('/api/admiral/converse', async (req: Request, res: Response): Promise<v
  */
 app.post('/api/admiral/suggest', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { operatorPrompt, archetype, failureSignal, provider = 'openrouter', model, apiKey } = req.body as {
+    const { operatorPrompt, archetype, failureSignal, provider, model, apiKey } = req.body as {
       operatorPrompt?: string; archetype?: string; failureSignal?: string; provider?: string; model?: string; apiKey?: string;
     };
     let prompt = typeof operatorPrompt === 'string' ? operatorPrompt : '';
@@ -7195,7 +7299,8 @@ app.post('/api/admiral/suggest', async (req: Request, res: Response): Promise<vo
     const advice = await admiral.suggest(prompt, failureSignal);
     res.json(advice);
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Admiral suggest failed' });
+    const message = error.message || 'Admiral suggest failed';
+    res.status(llmConfigErrorStatus(message)).json({ error: message });
   }
 });
 
@@ -7208,7 +7313,7 @@ app.post('/api/admiral/suggest', async (req: Request, res: Response): Promise<vo
  */
 app.post('/api/admiral/launch', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { brief, confirmed, provider = 'openrouter', model, apiKey } = req.body as {
+    const { brief, confirmed, provider, model, apiKey } = req.body as {
       brief: MissionBrief; confirmed?: boolean; provider?: string; model?: string; apiKey?: string;
     };
     if (!brief || !brief.objective || !brief.target) {
@@ -7227,7 +7332,8 @@ app.post('/api/admiral/launch', async (req: Request, res: Response): Promise<voi
     try {
       generalConfig = resolveGeneralLLMConfig(provider, model, apiKey);
     } catch (error: any) {
-      res.status(400).json({ error: error.message || 'API key required' });
+      const message = error.message || 'API key required';
+      res.status(llmConfigErrorStatus(message)).json({ error: message });
       return;
     }
 
@@ -7281,7 +7387,8 @@ app.post('/api/admiral/launch', async (req: Request, res: Response): Promise<voi
         : 'Plan produced no operators to spawn — nothing is running.',
     });
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Admiral launch failed' });
+    const message = error.message || 'Admiral launch failed';
+    res.status(llmConfigErrorStatus(message)).json({ error: message });
   }
 });
 
