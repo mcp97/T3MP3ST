@@ -286,8 +286,10 @@ You'll need an API key from one of these providers:
 • ${chalk.cyan('Anthropic')} - Direct Claude access
 • ${chalk.cyan('OpenAI')} - GPT models
 
+Or select ${chalk.cyan('Codex CLI')} as a keyless backend that uses your local logged-in Codex account.
+
 The setup will guide you through:
-1. Adding your API key(s)
+1. Adding your API key(s), or skipping keys for Codex CLI
 2. Selecting your default provider and model
 3. Configuring basic settings`,
     'cyan'
@@ -298,12 +300,13 @@ The setup will guide you through:
   const hasAnthropic = hasApiKey('anthropic');
   const hasOpenAI = hasApiKey('openai');
 
-  if (hasOpenRouter || hasAnthropic || hasOpenAI) {
+  if (hasOpenRouter || hasAnthropic || hasOpenAI || config.get('defaultProvider') === 'codex') {
     console.log('');
-    showInfo('Existing API keys detected:');
+    showInfo('Existing provider configuration detected:');
     if (hasOpenRouter) showSuccess('  OpenRouter: configured');
     if (hasAnthropic) showSuccess('  Anthropic: configured');
     if (hasOpenAI) showSuccess('  OpenAI: configured');
+    if (config.get('defaultProvider') === 'codex') showSuccess('  Codex CLI: selected');
     console.log('');
 
     const { action } = await inquirer.prompt([
@@ -365,7 +368,7 @@ async function setupApiKeys(): Promise<void> {
     {
       type: 'checkbox',
       name: 'providers',
-      message: 'Which API keys would you like to configure?',
+      message: 'Which API provider keys would you like to configure? Skip all to use Codex CLI.',
       choices: [
         {
           name: `OpenRouter ${hasApiKey('openrouter') ? chalk.green('(configured)') : chalk.yellow('(recommended)')}`,
@@ -413,17 +416,7 @@ async function setupProvider(): Promise<void> {
   if (hasApiKey('venice')) configuredProviders.push({ name: 'Venice', value: 'venice' });
   if (hasApiKey('anthropic')) configuredProviders.push({ name: 'Anthropic', value: 'anthropic' });
   if (hasApiKey('openai')) configuredProviders.push({ name: 'OpenAI', value: 'openai' });
-
-  if (configuredProviders.length === 0) {
-    showWarning('No API keys configured. Please add at least one API key first.');
-    return;
-  }
-
-  if (configuredProviders.length === 1) {
-    config.setDefaultProvider(configuredProviders[0].value as any);
-    showSuccess(`Default provider set to: ${configuredProviders[0].name}`);
-    return;
-  }
+  configuredProviders.push({ name: 'Codex CLI (keyless; uses your local logged-in Codex account)', value: 'codex' });
 
   const { provider } = await inquirer.prompt([
     {

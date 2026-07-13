@@ -15725,7 +15725,7 @@ ACTION_INPUT: {"output":"Found confirmed SQLi on /login endpoint..."}`;
 
         function getGeneralConfig() {
             const apiKey = getApiKey();
-            const provider = localStorage.getItem('t3mp3st_general_provider') || (T3MP3ST_API?.connected ? 'codex' : 'openrouter');
+            const provider = localStorage.getItem('t3mp3st_general_provider') || 'openrouter';
             const model = provider === 'codex' ? 'codex-default' : (state.settings?.selectedModel || 'anthropic/claude-sonnet-4');
             return { apiKey, provider, model };
         }

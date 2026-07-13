@@ -8,7 +8,10 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
 
 // Mock the local-agent CLI bridge (LocalAgentAdapter) and the codex spawn/file read (CodexAdapter).
-vi.mock('../agent/local-agents.js', () => ({ localAgentChat: vi.fn() }));
+vi.mock('../agent/local-agents.js', () => ({
+  localAgentChat: vi.fn(),
+  localAgentChildEnv: vi.fn(() => ({ HOME: '/tmp/t3mp3st-test-home' })),
+}));
 vi.mock('child_process', () => ({
   spawn: vi.fn(() => {
     const child = new EventEmitter() as EventEmitter & { stdin: { end: () => void }; stdout: EventEmitter; stderr: EventEmitter };

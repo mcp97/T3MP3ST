@@ -11,6 +11,41 @@ import { join } from 'path';
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import type { LLMProvider, LLMConfig, FallbackEntry, OpsecLevel } from '../types/index.js';
 
+export type ApiKeyProvider = 'openrouter' | 'venice' | 'anthropic' | 'openai' | 'xai' | 'gemini';
+const API_KEY_PROVIDERS = new Set<LLMProvider>(['openrouter', 'venice', 'anthropic', 'openai', 'xai', 'gemini']);
+
+export function providerNeedsApiKey(provider: LLMProvider | string): provider is ApiKeyProvider {
+  return API_KEY_PROVIDERS.has(provider as LLMProvider);
+}
+
+export function inferProviderFromApiKey(apiKey: string | undefined): ApiKeyProvider | undefined {
+  const key = apiKey?.trim();
+  if (!key) return undefined;
+  if (key.startsWith('sk-ant-')) return 'anthropic';
+  if (key.startsWith('sk-or-')) return 'openrouter';
+  if (key.startsWith('sk-proj-') || key.startsWith('sk-')) return 'openai';
+  return undefined;
+}
+
+export function resolveProviderForRequest(
+  provider: string | undefined,
+  apiKey: string | undefined,
+  defaultProvider: LLMProvider,
+): LLMProvider {
+  const explicitProvider = provider?.trim();
+  if (explicitProvider) return explicitProvider as LLMProvider;
+
+  const inferredProvider = inferProviderFromApiKey(apiKey);
+  if (inferredProvider) return inferredProvider;
+
+  // Preserve the legacy body-apiKey path when the configured default is keyless
+  // (for example Codex). An opaque key with no provider should still use the
+  // default API-key transport instead of being ignored by a keyless backend.
+  if (apiKey?.trim() && !providerNeedsApiKey(defaultProvider)) return 'openrouter';
+
+  return defaultProvider;
+}
+
 // =============================================================================
 // CONFIGURATION SCHEMA
 // =============================================================================
@@ -634,9 +669,18 @@ class ConfigManager {
   /**
    * Check if a provider has a valid API key configured
    */
-  hasApiKey(provider: 'openrouter' | 'venice' | 'anthropic' | 'openai' | 'xai' | 'gemini' | 'local'): boolean {
+  hasApiKey(provider: ApiKeyProvider): boolean {
     const key = this.getApiKey(provider);
     return !!key && key.length > 10;
+  }
+
+  /**
+   * Check if a provider can be selected without a stored T3MP3ST API key.
+   * Keyless providers still validate their local runtime when they are invoked.
+   */
+  isProviderConfigured(provider: LLMProvider): boolean {
+    if (providerNeedsApiKey(provider)) return this.hasApiKey(provider);
+    return ['codex', 'mock', 'local', 'local-agent'].includes(provider);
   }
 
   /**
@@ -649,7 +693,7 @@ class ConfigManager {
   }
 
   /**
-   * Get configured providers (those with API keys)
+   * Get providers available from stored API keys or keyless local backends.
    */
   getConfiguredProviders(): LLMProvider[] {
     const providers: LLMProvider[] = [];
@@ -679,6 +723,7 @@ class ConfigManager {
     let apiKey: string | undefined;
     let baseUrl: string | undefined;
     let actualModel: string;
+    let timeout = this.config.get('timeout');
 
     switch (actualProvider) {
       case 'openrouter':
@@ -715,6 +760,7 @@ class ConfigManager {
         break;
       case 'codex':
         actualModel = model || this.config.get('codex').defaultModel;
+        timeout = Number(process.env.T3MP3ST_CODEX_TIMEOUT_MS) || 300000;
         break;
       case 'mock':
         actualModel = 'mock-model';
@@ -742,7 +788,7 @@ class ConfigManager {
       baseUrl,
       maxTokens: this.config.get('maxTokens'),
       temperature: this.config.get('temperature'),
-      timeout: this.config.get('timeout'),
+      timeout,
       fallbackChain: this.buildFallbackChain(actualProvider),
     };
   }
@@ -920,8 +966,9 @@ TEMPEST_LOCAL_API_KEY=
 export const config = new ConfigManager();
 
 // Helper functions for quick access
-export const getApiKey = (provider: 'openrouter' | 'venice' | 'anthropic' | 'openai' | 'xai' | 'gemini') => config.getApiKey(provider);
-export const setApiKey = (provider: 'openrouter' | 'venice' | 'anthropic' | 'openai' | 'xai' | 'gemini', key: string) => config.setApiKey(provider, key);
-export const hasApiKey = (provider: 'openrouter' | 'venice' | 'anthropic' | 'openai' | 'xai' | 'gemini') => config.hasApiKey(provider);
+export const getApiKey = (provider: ApiKeyProvider) => config.getApiKey(provider);
+export const setApiKey = (provider: ApiKeyProvider, key: string) => config.setApiKey(provider, key);
+export const hasApiKey = (provider: ApiKeyProvider) => config.hasApiKey(provider);
+export const isProviderConfigured = (provider: LLMProvider) => config.isProviderConfigured(provider);
 export const getLLMConfig = (provider?: LLMProvider, model?: string) => config.getLLMConfig(provider, model);
 export const getConfiguredProviders = () => config.getConfiguredProviders();

@@ -27,6 +27,7 @@ import {
 import {
   config,
   hasApiKey,
+  isProviderConfigured,
   setApiKey,
   getConfiguredProviders,
   AVAILABLE_MODELS,
@@ -163,13 +164,16 @@ function displayStatus(tempest: Tempest): void {
 async function interactiveMode(): Promise<void> {
   showBanner();
 
-  // Check for API keys
-  const providers = getConfiguredProviders().filter(p => p !== 'mock');
+  // Check whether the selected default provider is usable.
+  const providers = getConfiguredProviders().filter(p => p !== 'mock' && p !== 'local');
+  const defaultProvider = config.get('defaultProvider');
 
-  if (providers.length === 0) {
+  if (!isProviderConfigured(defaultProvider)) {
     showBox(
       'Setup Required',
-      `No API keys configured. Please run setup first:
+      `Default provider is not configured: ${chalk.cyan(defaultProvider)}
+
+Run setup to add an API key or select Codex CLI as the keyless provider:
 
 ${chalk.cyan('npx t3mp3st setup')}
 
@@ -655,18 +659,19 @@ program
   .action(async () => {
     showBanner();
 
-    const provider = config.get('defaultProvider');
+    const llmConfig = config.getLLMConfig();
 
-    if (!hasApiKey(provider as any)) {
-      showError(`No API key configured for ${provider}`);
-      showInfo('Run "npx t3mp3st setup" to configure API keys');
+    if (!isProviderConfigured(llmConfig.provider)) {
+      showError(`Provider is not configured: ${llmConfig.provider}`);
+      showInfo(llmConfig.provider === 'codex' ? 'Install/login to the Codex CLI, then retry.' : 'Run "npx t3mp3st setup" to configure API keys');
+      process.exitCode = 1;
       return;
     }
 
-    const spinner = ora(`Testing connection to ${provider}...`).start();
+    const spinner = ora(`Testing connection to ${llmConfig.provider}...`).start();
 
     try {
-      const llm = new LLMBackbone(config.getLLMConfig());
+      const llm = new LLMBackbone(llmConfig);
       const response = await llm.prompt('Say "Connection successful!" and nothing else.');
 
       spinner.succeed('Connection successful!');
@@ -676,6 +681,7 @@ program
     } catch (error) {
       spinner.fail('Connection failed');
       showError(`${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
     }
   });
 

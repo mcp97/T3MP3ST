@@ -60,7 +60,7 @@ const expand = (p: string): string => (p.startsWith('~') ? agentHome() + p.slice
  *     when t3mp3st itself runs with HOME redirected for app-config storage. Same home the detector
  *     used, so "detected as authed" and "actually authenticates when spawned" stay consistent.
  */
-function childEnv(): NodeJS.ProcessEnv {
+export function localAgentChildEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const k of PROVIDER_ENV_TO_STRIP) delete env[k];
   const home = agentHome();
@@ -263,8 +263,8 @@ export function runLocalAgent(
   const args = spec.oneShot(prompt, opts.model);
   const timeoutMs = opts.timeoutMs ?? envTimeoutMs('T3MP3ST_LOCAL_AGENT_TIMEOUT_MS', 600000);
   const maxChars = opts.maxChars ?? 4000;
-  // child env: provider keys stripped + HOME pinned to the real agent home (see childEnv).
-  const env = childEnv();
+  // child env: provider keys stripped + HOME pinned to the real agent home (see localAgentChildEnv).
+  const env = localAgentChildEnv();
   return new Promise((resolve) => {
     // stdin:'ignore' so the agent doesn't stall waiting on piped input (e.g. `claude -p`'s 3s stdin wait).
     const child = spawn(spec.bin, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -308,8 +308,8 @@ export function pingLocalAgent(id: string, prompt?: string, timeoutMs?: number):
 export function localAgentChat(id: string, prompt: string, opts: { model?: string; timeoutMs?: number } = {}): Promise<string> {
   const spec = getSpec(id);
   if (!spec) return Promise.reject(new Error(`unknown local agent: ${id}`));
-  // child env: provider keys stripped + HOME pinned to the real agent home (see childEnv).
-  const env = childEnv();
+  // child env: provider keys stripped + HOME pinned to the real agent home (see localAgentChildEnv).
+  const env = localAgentChildEnv();
   const model = opts.model && opts.model !== 'codex-default' && opts.model !== id ? opts.model : undefined;
   const timeoutMs = opts.timeoutMs ?? envTimeoutMs('T3MP3ST_LOCAL_AGENT_TIMEOUT_MS', 600000);
 
